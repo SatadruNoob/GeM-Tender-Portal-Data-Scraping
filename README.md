@@ -43,15 +43,6 @@ gem_all_bids.csv
 
 
 
-
-
-
-
-https://github.com/user-attachments/assets/a75e462a-7446-441d-a8ee-bfedb1ea8c59
-
-
-
-
 https://github.com/user-attachments/assets/3cb3abce-a933-4670-bf9b-343be17aa90a
 
 
