@@ -1,18 +1,72 @@
 # file: gem_all_bids_playwright_csv.py
+# FULLY INSTRUMENTED DEBUG VERSION
+# FINAL FIX: BULLETPROOF ITEMS EXTRACTION (TEXT NODE + POPOVER SAFE)
 
-from playwright.sync_api import sync_playwright, TimeoutError
-import pandas as pd
-import time
+import sys
 import os
+import time
+from pathlib import Path
+from datetime import datetime
+
+import pandas as pd
+from playwright.sync_api import sync_playwright, TimeoutError
+
+print("SCRAPER CWD:", os.getcwd())
+
+# -------------------------------------------------
+# Resolve BASE directory (exe-aware)
+# -------------------------------------------------
+if getattr(sys, "frozen", False):
+    INTERNAL_DIR = Path(sys._MEIPASS)
+else:
+    INTERNAL_DIR = Path(__file__).parent
+
+BASE_DIR = INTERNAL_DIR
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
 
 START_URL = "https://bidplus.gem.gov.in/all-bids"
-CSV_FILE = "gem_all_bids.csv"
+CSV_FILE = DATA_DIR / "gem_all_bids.csv"
 
 PAGE_DELAY_SEC = 1.5
-SAVE_EVERY_PAGES = 3
 MAX_NEXT_MISSES = 2
 
+DEBUG_DIR = BASE_DIR / "debug_artifacts"
+DEBUG_DIR.mkdir(exist_ok=True)
 
+LOG_FILE = DATA_DIR / "scrape_status.log"
+
+SEARCH_KEYWORD = "batter"   # targeted keyword
+
+# -------------------------------------------------
+# Logging helpers
+# -------------------------------------------------
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+    try:
+        print(line)
+    except OSError:
+        pass
+
+
+def dump_debug(page, page_index, reason):
+    prefix = DEBUG_DIR / f"page_{page_index}_{reason}"
+    page.screenshot(path=f"{prefix}.png", full_page=True)
+    with open(f"{prefix}.html", "w", encoding="utf-8") as f:
+        f.write(page.content())
+    log(f"[debug] Dumped DOM + screenshot: {prefix}")
+
+# -------------------------------------------------
+# Extraction
+# -------------------------------------------------
 def extract_bids(page):
     bids = []
     cards = page.locator("div.card")
@@ -21,21 +75,49 @@ def extract_bids(page):
     for i in range(count):
         card = cards.nth(i)
 
-        bid_link = card.locator("a.bid_no_hover", has_text="/B/")
-        if bid_link.count() == 0:
+        bid_links = card.locator(".bid_no_hover")
+        if bid_links.count() == 0:
             continue
 
-        bid_no = bid_link.first.inner_text().strip()
+        bid_no = bid_links.first.inner_text().strip()
 
-        items_el = card.locator("strong:has-text('Items:') + a")
-        items = items_el.get_attribute("data-content") if items_el.count() else ""
+        # -------------------------------------------------
+        # FINAL BULLETPROOF ITEMS EXTRACTION
+        #
+        # Handles:
+        # 1) <a data-content="FULL NAME"> (popover case)
+        # 2) <a>Full name</a> (no popover)
+        # 3) Plain text node after <strong>Items:</strong>
+        #
+        # Uses textContent (NOT inner_text) to capture text nodes
+        # -------------------------------------------------
+        items = ""
 
-        quantity_text = (
-            card.locator("strong:has-text('Quantity:')")
-            .locator("..")
-            .inner_text()
-        )
-        quantity = quantity_text.replace("Quantity:", "").strip()
+        items_block = card.locator("strong:has-text('Items:')").locator("..")
+
+        if items_block.count():
+            # Case 1 & 2: anchor exists
+            a_tag = items_block.locator("a")
+            if a_tag.count():
+                # 1️⃣ Popover data-content (preferred)
+                dc = a_tag.first.get_attribute("data-content")
+                if dc:
+                    items = dc.strip()
+                else:
+                    # 2️⃣ Anchor text fallback
+                    txt = a_tag.first.text_content()
+                    if txt and txt.strip().lower() != "view":
+                        items = txt.strip()
+
+            # 3️⃣ Plain text node fallback (NO <a> present)
+            if not items:
+                raw = items_block.evaluate("el => el.textContent")
+                if raw:
+                    items = raw.replace("Items:", "").strip()
+
+        # -------------------------------------------------
+        quantity_el = card.locator("strong:has-text('Quantity:')").locator("..")
+        quantity = quantity_el.inner_text().replace("Quantity:", "").strip()
 
         dept_block = card.locator("div.col-md-5 .row").nth(1)
         department = dept_block.inner_text().replace("\n", " | ").strip()
@@ -52,32 +134,39 @@ def extract_bids(page):
             "End Date": end_date,
         })
 
+        # Audit log for absolute certainty
+        if not items:
+            log(f"[WARN] Items missing for Bid {bid_no}")
+
     return bids
 
-
+# -------------------------------------------------
+# CSV helpers
+# -------------------------------------------------
 def append_to_csv(rows):
+    if not rows:
+        return
     df = pd.DataFrame(rows)
-    write_header = not os.path.exists(CSV_FILE)
+    write_header = not CSV_FILE.exists()
     df.to_csv(CSV_FILE, mode="a", index=False, header=write_header)
 
 
-def load_seen_from_csv():
-    if not os.path.exists(CSV_FILE):
+def load_seen():
+    if not CSV_FILE.exists():
         return set()
     df = pd.read_csv(CSV_FILE, usecols=["Bid No"])
     return set(df["Bid No"].astype(str))
 
-
+# -------------------------------------------------
+# Main
+# -------------------------------------------------
 def main():
-    buffer = []
-    seen = load_seen_from_csv()
+    seen = load_seen()
     page_index = 1
     next_misses = 0
 
-    print(f"[init] Loaded {len(seen)} existing bids from CSV")
-
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=50)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context(
             viewport={"width": 1400, "height": 900},
             user_agent=(
@@ -88,77 +177,116 @@ def main():
         )
         page = context.new_page()
 
-        print("[*] Opening GeM All Bids…")
+        log("Opening GeM All Bids…")
         page.goto(START_URL, timeout=90_000)
-        page.wait_for_selector("div.card", timeout=60_000)
 
-        while True:
-            print(f"[*] Parsing page {page_index}")
+        try:
+            page.wait_for_selector("div.card", timeout=60_000)
+        except TimeoutError:
+            dump_debug(page, page_index, "initial_load_failed")
+            return
 
-            bids = extract_bids(page)
-            added = 0
+        # -------------------------------------------------
+        # APPLY KEYWORD SEARCH
+        # -------------------------------------------------
+        try:
+            log(f"[SEARCH] Applying keyword filter: {SEARCH_KEYWORD}")
 
-            for bid in bids:
-                if bid["Bid No"] not in seen:
-                    seen.add(bid["Bid No"])
-                    buffer.append(bid)
-                    added += 1
+            search_box = page.locator("#searchBid")
+            search_box.wait_for(timeout=30_000)
 
-            print(f"[+] Added {added} bids | buffer={len(buffer)}")
+            search_box.fill("")
+            search_box.type(SEARCH_KEYWORD, delay=100)
+            search_box.press("Enter")
 
-            if page_index % SAVE_EVERY_PAGES == 0 and buffer:
-                append_to_csv(buffer)
-                print(f"[✓] Saved {len(buffer)} rows to CSV")
-                buffer.clear()
+            page.wait_for_timeout(1500)
+            page.wait_for_selector("div.card", timeout=60_000)
 
-            print("[debug] Checking Next button state")
-            next_btn = page.locator("#light-pagination .next:not(.current)")
+            cards_after_search = page.locator("div.card").count()
+            log(f"[SEARCH] Cards after filter: {cards_after_search}")
 
-            if next_btn.count() == 0:
-                next_misses += 1
-                print(f"[warn] Next button missing ({next_misses}/{MAX_NEXT_MISSES})")
-                if next_misses >= MAX_NEXT_MISSES:
-                    print("[✓] Next button gone consistently. Done.")
+        except TimeoutError:
+            dump_debug(page, page_index, "search_failed")
+            log("[FATAL] Keyword search failed")
+            return
+
+        # -------------------------------------------------
+        # SCRAPING LOOP
+        # -------------------------------------------------
+        try:
+            while True:
+                log(f"[heartbeat] page={page_index}")
+
+                cards_count = page.locator("div.card").count()
+                log(f"[debug] cards_found={cards_count}")
+
+                if cards_count == 0:
+                    dump_debug(page, page_index, "no_cards")
                     break
-                time.sleep(2)
-                continue
-            else:
+
+                bids = extract_bids(page)
+                buffer = []
+
+                for bid in bids:
+                    if bid["Bid No"] not in seen:
+                        seen.add(bid["Bid No"])
+                        buffer.append(bid)
+
+                log(f"[+] Added {len(buffer)} bids")
+                append_to_csv(buffer)
+
+                # ---------------- Pagination ----------------
+                next_btn = page.locator("#light-pagination .next:not(.current)")
+                log("[debug] Checking Next button")
+
+                if next_btn.count() == 0:
+                    next_misses += 1
+                    log(f"[WARN] Next button missing ({next_misses}/{MAX_NEXT_MISSES})")
+
+                    if next_misses >= MAX_NEXT_MISSES:
+                        dump_debug(page, page_index, "next_missing")
+                        log("[STOP] Pagination ended")
+                        break
+
+                    time.sleep(2)
+                    continue
+
                 next_misses = 0
 
-            first_bid = page.locator("a.bid_no_hover", has_text="/B/").first.inner_text()
+                first_bid = page.locator(".bid_no_hover").first.inner_text()
 
-            next_btn.click()
-            time.sleep(PAGE_DELAY_SEC)
-
-            try:
-                page.wait_for_function(
-                    f"""
-                    () => {{
-                        const el = [...document.querySelectorAll('a.bid_no_hover')]
-                          .find(a => a.innerText.includes('/B/'));
-                        return el && el.innerText !== {first_bid!r};
-                    }}
-                    """,
-                    timeout=60_000,
-                )
-            except TimeoutError:
-                print(f"[!] Pagination stalled on page {page_index}")
-                page.screenshot(path=f"stall_page_{page_index}.png")
-                print("[warn] Retrying click instead of stopping")
                 next_btn.click()
                 time.sleep(PAGE_DELAY_SEC)
-                continue
 
-            page_index += 1
+                try:
+                    page.wait_for_function(
+                        """
+                        (prev) => {
+                            const el = document.querySelector('.bid_no_hover');
+                            return el && el.innerText !== prev;
+                        }
+                        """,
+                        arg=first_bid,
+                        timeout=60_000,
+                    )
+                    log("[debug] Page changed successfully")
+                except TimeoutError:
+                    dump_debug(page, page_index, "dom_timeout")
+                    log("[WARN] DOM unchanged, retrying")
+                    continue
+
+                page_index += 1
+
+        except Exception as e:
+            import traceback
+            log(f"[FATAL] Main loop crash: {e}")
+            log(traceback.format_exc())
+            dump_debug(page, page_index, "main_loop_crash")
 
         browser.close()
 
-    if buffer:
-        append_to_csv(buffer)
-        print(f"[✓] Final save: {len(buffer)} rows")
+    log("[✓] Scraping finished")
 
-    print(f"[✓] Finished. Output file: {CSV_FILE}")
-
-
+# -------------------------------------------------
 if __name__ == "__main__":
     main()
